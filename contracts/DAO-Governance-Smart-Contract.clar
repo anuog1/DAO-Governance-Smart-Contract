@@ -248,3 +248,260 @@
     (ok true)
   )
 )
+;; Transfer DAO admin rights
+(define-public (transfer-dao-admin (new-admin principal))
+  (begin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    (var-set dao-admin new-admin)
+    (ok true)
+  )
+)
+
+;; Update a governance parameter
+(define-public (update-governance-parameter (parameter-name (string-ascii 50)) (parameter-value uint))
+  (begin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    
+    (match parameter-name
+      "voting-period" (var-set voting-period parameter-value)
+      "quorum-threshold" (var-set quorum-threshold parameter-value)
+      "execution-delay" (var-set execution-delay parameter-value)
+      "approval-threshold" (var-set approval-threshold parameter-value)
+      "membership-duration" (var-set membership-duration parameter-value)
+      "proposal-cooldown" (var-set proposal-cooldown parameter-value)
+      (err ERR-INVALID-PARAMETER)
+    )
+    
+    (ok true)
+  )
+)
+
+;; ===============================================
+;; Proposal Management
+;; ===============================================
+
+;; Create a new governance proposal
+(define-public (create-governance-proposal
+                (title (string-ascii 100))
+                (description (string-ascii 500))
+                (proposal-type uint)
+                (execution-data (optional (buff 1024))))
+  (let
+    (
+      (new-proposal-id (var-get proposal-count))
+      (start-block (+ block-height u1))
+      (end-block (+ start-block (var-get voting-period)))
+      (execution-block (+ end-block (var-get execution-delay)))
+      (user-voting-power (get-voting-power tx-sender))
+    )
+    
+    ;; Check if user is an active member
+    (asserts! (is-active-member tx-sender) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if proposal type is valid
+    (asserts! (or
+                (is-eq proposal-type PROPOSAL-TYPE-GOVERNANCE)
+                (is-eq proposal-type PROPOSAL-TYPE-TREASURY)
+                (is-eq proposal-type PROPOSAL-TYPE-MEMBERSHIP)
+                (is-eq proposal-type PROPOSAL-TYPE-CONTRACT)
+                (is-eq proposal-type PROPOSAL-TYPE-PARAMETER))
+              ERR-INVALID-PROPOSAL-TYPE)
+    
+    ;; Check if user has enough voting power
+    (asserts! (>= user-voting-power u10) ERR-INSUFFICIENT-TOKENS)
+    
+    ;; Create proposal
+    (map-set proposals
+      { proposal-id: new-proposal-id }
+      {
+        title: title,
+        description: description,
+        proposer: tx-sender,
+        proposal-type: proposal-type,
+        start-block-height: start-block,
+        end-block-height: end-block,
+        execution-block-height: execution-block,
+        votes-for: u0,
+        votes-against: u0,
+        votes-abstain: u0,
+        total-voting-power: u0,
+        status: u0,  ;; Active
+        executed: false,
+        execution-data: execution-data
+      }
+    )
+    
+    ;; Increment proposal count
+    (var-set proposal-count (+ new-proposal-id u1))
+    
+    (ok new-proposal-id)
+  )
+)
+
+;; Create a treasury proposal
+(define-public (create-treasury-proposal
+                (title (string-ascii 100))
+                (desc (string-ascii 500))
+                (recipient principal)
+                (amount uint)
+                (tx-description (string-ascii 200)))
+  (let
+    (
+      (proposal-result (try! (create-governance-proposal title desc PROPOSAL-TYPE-TREASURY none)))
+    )
+    
+    ;; Validate amount
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    ;; Store treasury-specific proposal data
+    (map-set treasury-proposals
+      { proposal-id: proposal-result }
+      {
+        recipient: recipient,
+        amount: amount,
+        description: tx-description
+      }
+    )
+    
+    (ok proposal-result)
+  )
+)
+
+;; Create a membership proposal
+(define-public (create-membership-proposal
+                (title (string-ascii 100))
+                (desc (string-ascii 500))
+                (target principal)
+                (action uint)
+                (roles (list 10 (string-ascii 20)))
+                (power uint))
+  (let
+    (
+      (proposal-result (try! (create-governance-proposal title desc PROPOSAL-TYPE-MEMBERSHIP none)))
+    )
+    
+    ;; Validate action (1:Add, 2:Remove, 3:UpdateRoles)
+    (asserts! (or (is-eq action u1) (is-eq action u2) (is-eq action u3)) ERR-INVALID-PARAMETER)
+    
+    ;; Store membership-specific proposal data
+    (map-set membership-proposals
+      { proposal-id: proposal-result }
+      {
+        target-member: target,
+        action: action,
+        roles: roles,
+        voting-power: power
+      }
+    )
+    
+    (ok proposal-result)
+  )
+)
+
+;; Create a parameter change proposal
+(define-public (create-parameter-proposal
+                (title (string-ascii 100))
+                (desc (string-ascii 500))
+                (param-name (string-ascii 50))
+                (param-value uint))
+  (let
+    (
+      (proposal-result (try! (create-governance-proposal title desc PROPOSAL-TYPE-PARAMETER none)))
+    )
+    
+    ;; Store parameter-specific proposal data
+    (map-set parameter-proposals
+      { proposal-id: proposal-result }
+      {
+        parameter-name: param-name,
+        parameter-value: param-value
+      }
+    )
+    
+    (ok proposal-result)
+  )
+)
+
+;; Create a contract call proposal
+(define-public (create-contract-proposal
+                (title (string-ascii 100))
+                (desc (string-ascii 500))
+                (contract principal)
+                (function (string-ascii 128))
+                (args (list 10 (string-ascii 100))))
+  (let
+    (
+      (proposal-result (try! (create-governance-proposal title desc PROPOSAL-TYPE-CONTRACT none)))
+    )
+    
+    ;; Store contract-specific proposal data
+    (map-set contract-proposals
+      { proposal-id: proposal-result }
+      {
+        contract-address: contract,
+        function-name: function,
+        function-args: args
+      }
+    )
+    
+    (ok proposal-result)
+  )
+)
+
+;; ===============================================
+;; Voting Functions
+;; ===============================================
+
+;; Vote on a proposal
+(define-public (vote (proposal-id uint) (vote-type uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (user-voting-power (get-voting-power tx-sender))
+      (curr-block block-height)
+    )
+    
+    ;; Check if user is an active member
+    (asserts! (is-active-member tx-sender) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if proposal is still active for voting
+    (asserts! (<= curr-block (get end-block-height proposal)) ERR-VOTING-CLOSED)
+    
+    ;; Check if user has already voted
+    (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) ERR-ALREADY-VOTED)
+    
+    ;; Check if vote type is valid
+    (asserts! (or (is-eq vote-type VOTE-FOR) (is-eq vote-type VOTE-AGAINST) (is-eq vote-type VOTE-ABSTAIN)) ERR-INVALID-PARAMETER)
+    
+    ;; Record vote
+    (map-set votes
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote: vote-type, voting-power: user-voting-power }
+    )
+    
+    ;; Update proposal vote counts
+    (match vote-type
+      VOTE-FOR (map-set proposals
+                { proposal-id: proposal-id }
+                (merge proposal { 
+                  votes-for: (+ (get votes-for proposal) user-voting-power),
+                  total-voting-power: (+ (get total-voting-power proposal) user-voting-power)
+                }))
+      VOTE-AGAINST (map-set proposals
+                { proposal-id: proposal-id }
+                (merge proposal { 
+                  votes-against: (+ (get votes-against proposal) user-voting-power),
+                  total-voting-power: (+ (get total-voting-power proposal) user-voting-power)
+                }))
+      VOTE-ABSTAIN (map-set proposals
+                { proposal-id: proposal-id }
+                (merge proposal { 
+                  votes-abstain: (+ (get votes-abstain proposal) user-voting-power),
+                  total-voting-power: (+ (get total-voting-power proposal) user-voting-power)
+                }))
+      ERR-INVALID-PARAMETER
+    )
+    
+    (ok true)
+  )
+)
