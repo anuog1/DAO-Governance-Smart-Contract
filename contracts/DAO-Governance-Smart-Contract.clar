@@ -1,12 +1,6 @@
 ;; ===============================================
 ;; DAO Governance Smart Contract
 ;; ===============================================
-;; Author: Claude
-;; Version: 1.0
-;; Description: A comprehensive DAO governance smart contract for the Stacks blockchain
-;; with voting, proposal management, treasury, and member management capabilities.
-
-;; ===============================================
 ;; Constants
 ;; ===============================================
 
