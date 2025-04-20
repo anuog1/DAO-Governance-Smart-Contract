@@ -752,3 +752,130 @@
     (ok true)
   )
 )
+;; ===============================================
+;; Treasury Management
+;; ===============================================
+
+;; Deposit funds to the DAO treasury
+(define-public (deposit-to-treasury (amount uint) (description (string-ascii 200)))
+  (let
+    (
+      (tx-id (var-get proposal-count))
+      (current-balance (var-get treasury-balance))
+    )
+    
+    ;; Check if amount is valid
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update treasury balance
+    (var-set treasury-balance (+ current-balance amount))
+    
+    ;; Record transaction
+    (map-set treasury-transactions
+      { tx-id: tx-id }
+      {
+        tx-type: u1,  ;; Deposit
+        amount: amount,
+        sender-receiver: tx-sender,
+        block-height: block-height,
+        proposal-id: none,
+        description: description
+      }
+    )
+    
+    ;; Increment counter for next tx ID
+    (var-set proposal-count (+ tx-id u1))
+    
+    (ok true)
+  )
+)
+
+;; Admin can withdraw emergency funds
+(define-public (emergency-withdrawal (amount uint) (recipient principal) (description (string-ascii 200)))
+  (let
+    (
+      (tx-id (var-get proposal-count))
+      (current-balance (var-get treasury-balance))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if amount is valid and treasury has enough funds
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= current-balance amount) ERR-TREASURY-INSUFFICIENT-FUNDS)
+    
+    ;; Transfer STX to recipient
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    
+    ;; Update treasury balance
+    (var-set treasury-balance (- current-balance amount))
+    
+    ;; Record transaction
+    (map-set treasury-transactions
+      { tx-id: tx-id }
+      {
+        tx-type: u2,  ;; Withdrawal
+        amount: amount,
+        sender-receiver: recipient,
+        block-height: block-height,
+        proposal-id: none,
+        description: (concat "EMERGENCY: " description)
+      }
+    )
+    
+    ;; Increment counter for next tx ID
+    (var-set proposal-count (+ tx-id u1))
+    
+    (ok true)
+  )
+)
+
+;; ===============================================
+;; Membership Management
+;; ===============================================
+
+;; Admin can add members directly
+(define-public (admin-add-member (new-member principal) (roles (list 10 (string-ascii 20))) (power uint))
+  (let
+    (
+      (curr-member-count (var-get member-count))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if member already exists
+    (asserts! (is-none (map-get? members { member: new-member })) ERR-MEMBER-EXISTS)
+    
+    ;; Add new member
+    (map-set members
+      { member: new-member }
+      {
+        joining-block: block-height,
+        expiry-block: (+ block-height (var-get membership-duration)),
+        voting-power: power,
+        roles: roles,
+        active: true
+      }
+    )
+    
+    ;; Increment member count
+    (var-set member-count (+ curr-member-count u1))
+    
+    (ok true)
+  )
+)
+
+;; Admin can remove members directly
+(define-public (admin-remove-member (target principal))
+  (let
+    (
+      (curr-member-count (var-get member-count))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
