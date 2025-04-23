@@ -1,12 +1,6 @@
 ;; ===============================================
 ;; DAO Governance Smart Contract
 ;; ===============================================
-;; Author: Claude
-;; Version: 1.0
-;; Description: A comprehensive DAO governance smart contract for the Stacks blockchain
-;; with voting, proposal management, treasury, and member management capabilities.
-
-;; ===============================================
 ;; Constants
 ;; ===============================================
 
@@ -505,3 +499,765 @@
     (ok true)
   )
 )
+;; Finalize a proposal after voting period
+(define-public (finalize-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (curr-block block-height)
+      (votes-for (get votes-for proposal))
+      (votes-against (get votes-against proposal))
+      (total-votes (get total-voting-power proposal))
+      (quorum (/ (* (var-get quorum-threshold) (var-get member-count)) u1000))  ;; Scale quorum threshold
+      (approval (/ (* (var-get approval-threshold) total-votes) u1000))  ;; Scale approval threshold
+      (new-status (if (< total-votes quorum)
+                      u2  ;; Rejected due to quorum not reached
+                      (if (>= votes-for approval)
+                          u1  ;; Passed
+                          u2)))  ;; Rejected
+    )
+    
+    ;; Check if proposal voting period has ended
+    (asserts! (> curr-block (get end-block-height proposal)) ERR-PROPOSAL-ACTIVE)
+    
+    ;; Check if proposal is still active (not finalized yet)
+    (asserts! (is-eq (get status proposal) u0) ERR-PROPOSAL-NOT-READY)
+    
+    ;; Update proposal status
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { status: new-status })
+    )
+    
+    (ok new-status)
+  )
+)
+
+;; ===============================================
+;; Proposal Execution
+;; ===============================================
+
+;; Execute a passed proposal
+(define-public (execute-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (curr-block block-height)
+    )
+    
+    ;; Check if proposal passed
+    (asserts! (is-eq (get status proposal) u1) ERR-PROPOSAL-NOT-PASSED)
+    
+    ;; Check if proposal is ready for execution
+    (asserts! (>= curr-block (get execution-block-height proposal)) ERR-PROPOSAL-NOT-READY)
+    
+    ;; Check if proposal has not been executed yet
+    (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
+    
+    ;; Execute proposal based on type
+    (match (get proposal-type proposal)
+      PROPOSAL-TYPE-GOVERNANCE (execute-governance-proposal proposal-id)
+      PROPOSAL-TYPE-TREASURY (execute-treasury-proposal proposal-id)
+      PROPOSAL-TYPE-MEMBERSHIP (execute-membership-proposal proposal-id)
+      PROPOSAL-TYPE-CONTRACT (execute-contract-proposal proposal-id)
+      PROPOSAL-TYPE-PARAMETER (execute-parameter-proposal proposal-id)
+      ERR-INVALID-PROPOSAL-TYPE
+    )
+  )
+)
+
+;; Execute a governance proposal
+(define-private (execute-governance-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    )
+    
+    ;; Mark proposal as executed
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true, status: u3 })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute a treasury proposal
+(define-private (execute-treasury-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (treasury-data (unwrap! (map-get? treasury-proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (recipient (get recipient treasury-data))
+      (amount (get amount treasury-data))
+      (description (get description treasury-data))
+      (current-balance (var-get treasury-balance))
+      (tx-id (var-get proposal-count))
+    )
+    
+    ;; Check if treasury has enough funds
+    (asserts! (>= current-balance amount) ERR-TREASURY-INSUFFICIENT-FUNDS)
+    
+    ;; Transfer tokens
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    
+    ;; Update treasury balance
+    (var-set treasury-balance (- current-balance amount))
+    
+    ;; Record transaction
+    (map-set treasury-transactions
+      { tx-id: tx-id }
+      {
+        tx-type: u2,  ;; Withdrawal
+        amount: amount,
+        sender-receiver: recipient,
+        block-height: block-height,
+        proposal-id: (some proposal-id),
+        description: description
+      }
+    )
+    
+    ;; Mark proposal as executed
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true, status: u3 })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute a membership proposal
+(define-private (execute-membership-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (membership-data (unwrap! (map-get? membership-proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (target (get target-member membership-data))
+      (action (get action membership-data))
+      (roles (get roles membership-data))
+      (power (get voting-power membership-data))
+      (curr-member-count (var-get member-count))
+    )
+    
+    ;; Execute based on action type
+    (match action
+      ;; Add member
+      u1 (begin
+            ;; Check if member already exists
+            (asserts! (is-none (map-get? members { member: target })) ERR-MEMBER-EXISTS)
+            
+            ;; Add new member
+            (map-set members
+              { member: target }
+              {
+                joining-block: block-height,
+                expiry-block: (+ block-height (var-get membership-duration)),
+                voting-power: power,
+                roles: roles,
+                active: true
+              }
+            )
+            
+            ;; Increment member count
+            (var-set member-count (+ curr-member-count u1))
+          )
+      
+      ;; Remove member
+      u2 (begin
+            ;; Check if member exists
+            (asserts! (is-some (map-get? members { member: target })) ERR-MEMBER-NOT-FOUND)
+            
+            ;; Remove member
+            (map-delete members { member: target })
+            
+            ;; Decrement member count
+            (var-set member-count (- curr-member-count u1))
+          )
+      
+      ;; Update member roles
+      u3 (begin
+            ;; Get existing member data
+            (match (map-get? members { member: target })
+              member-data (map-set members
+                            { member: target }
+                            (merge member-data {
+                              voting-power: power,
+                              roles: roles
+                            })
+                          )
+              ERR-MEMBER-NOT-FOUND
+            )
+          )
+      
+      ERR-INVALID-PARAMETER
+    )
+    
+    ;; Mark proposal as executed
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true, status: u3 })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute a parameter change proposal
+(define-private (execute-parameter-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (parameter-data (unwrap! (map-get? parameter-proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (param-name (get parameter-name parameter-data))
+      (param-value (get parameter-value parameter-data))
+    )
+    
+    ;; Update parameter
+    (try! (update-governance-parameter param-name param-value))
+    
+    ;; Mark proposal as executed
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true, status: u3 })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute a contract call proposal (simplified for compatibility)
+(define-private (execute-contract-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    )
+    
+    ;; Note: In a real implementation, we would parse the contract-proposals data
+    ;; and execute the contract call, but for simplicity, we'll just mark as executed
+    
+    ;; Mark proposal as executed
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { executed: true, status: u3 })
+    )
+    
+    (ok true)
+  )
+)
+;; ===============================================
+;; Treasury Management
+;; ===============================================
+
+;; Deposit funds to the DAO treasury
+(define-public (deposit-to-treasury (amount uint) (description (string-ascii 200)))
+  (let
+    (
+      (tx-id (var-get proposal-count))
+      (current-balance (var-get treasury-balance))
+    )
+    
+    ;; Check if amount is valid
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    
+    ;; Transfer STX to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Update treasury balance
+    (var-set treasury-balance (+ current-balance amount))
+    
+    ;; Record transaction
+    (map-set treasury-transactions
+      { tx-id: tx-id }
+      {
+        tx-type: u1,  ;; Deposit
+        amount: amount,
+        sender-receiver: tx-sender,
+        block-height: block-height,
+        proposal-id: none,
+        description: description
+      }
+    )
+    
+    ;; Increment counter for next tx ID
+    (var-set proposal-count (+ tx-id u1))
+    
+    (ok true)
+  )
+)
+
+;; Admin can withdraw emergency funds
+(define-public (emergency-withdrawal (amount uint) (recipient principal) (description (string-ascii 200)))
+  (let
+    (
+      (tx-id (var-get proposal-count))
+      (current-balance (var-get treasury-balance))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if amount is valid and treasury has enough funds
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= current-balance amount) ERR-TREASURY-INSUFFICIENT-FUNDS)
+    
+    ;; Transfer STX to recipient
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    
+    ;; Update treasury balance
+    (var-set treasury-balance (- current-balance amount))
+    
+    ;; Record transaction
+    (map-set treasury-transactions
+      { tx-id: tx-id }
+      {
+        tx-type: u2,  ;; Withdrawal
+        amount: amount,
+        sender-receiver: recipient,
+        block-height: block-height,
+        proposal-id: none,
+        description: (concat "EMERGENCY: " description)
+      }
+    )
+    
+    ;; Increment counter for next tx ID
+    (var-set proposal-count (+ tx-id u1))
+    
+    (ok true)
+  )
+)
+
+;; ===============================================
+;; Membership Management
+;; ===============================================
+
+;; Admin can add members directly
+(define-public (admin-add-member (new-member principal) (roles (list 10 (string-ascii 20))) (power uint))
+  (let
+    (
+      (curr-member-count (var-get member-count))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if member already exists
+    (asserts! (is-none (map-get? members { member: new-member })) ERR-MEMBER-EXISTS)
+    
+    ;; Add new member
+    (map-set members
+      { member: new-member }
+      {
+        joining-block: block-height,
+        expiry-block: (+ block-height (var-get membership-duration)),
+        voting-power: power,
+        roles: roles,
+        active: true
+      }
+    )
+    
+    ;; Increment member count
+    (var-set member-count (+ curr-member-count u1))
+    
+    (ok true)
+  )
+)
+
+;; Admin can remove members directly
+(define-public (admin-remove-member (target principal))
+  (let
+    (
+      (curr-member-count (var-get member-count))
+    )
+    
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+;; Check if member exists
+    (asserts! (is-some (map-get? members { member: target })) ERR-MEMBER-NOT-FOUND)
+    
+    ;; Remove member
+    (map-delete members { member: target })
+    
+    ;; Decrement member count
+    (var-set member-count (- curr-member-count u1))
+    
+    (ok true)
+  )
+)
+
+;; Renew membership
+(define-public (renew-membership (member-address principal))
+  (begin
+    ;; Check if caller is admin or the member themselves
+    (asserts! (or (is-dao-admin) (is-eq tx-sender member-address)) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if member exists
+    (match (map-get? members { member: member-address })
+      member-data (map-set members
+                    { member: member-address }
+                    (merge member-data {
+                      expiry-block: (+ block-height (var-get membership-duration))
+                    })
+                  )
+      ERR-MEMBER-NOT-FOUND
+    )
+    
+    (ok true)
+  )
+)
+
+;; Update member roles
+(define-public (update-member-roles (target principal) (new-roles (list 10 (string-ascii 20))))
+  (begin
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if member exists
+    (match (map-get? members { member: target })
+      member-data (map-set members
+                    { member: target }
+                    (merge member-data {
+                      roles: new-roles
+                    })
+                  )
+      ERR-MEMBER-NOT-FOUND
+    )
+    
+    (ok true)
+  )
+)
+
+;; Update member voting power
+(define-public (update-member-voting-power (target principal) (new-power uint))
+  (begin
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if member exists
+    (match (map-get? members { member: target })
+      member-data (map-set members
+                    { member: target }
+                    (merge member-data {
+                      voting-power: new-power
+                    })
+                  )
+      ERR-MEMBER-NOT-FOUND
+    )
+    
+    (ok true)
+  )
+)
+
+;; ===============================================
+;; Read-only Functions
+;; ===============================================
+
+;; Get DAO information
+(define-read-only (get-dao-info)
+  {
+    name: (var-get dao-name),
+    description: (var-get dao-description),
+    token: (var-get dao-token),
+    admin: (var-get dao-admin),
+    member-count: (var-get member-count),
+    treasury-balance: (var-get treasury-balance),
+    proposal-count: (var-get proposal-count)
+  }
+)
+
+;; Get governance parameters
+(define-read-only (get-governance-parameters)
+  {
+    voting-period: (var-get voting-period),
+    quorum-threshold: (var-get quorum-threshold),
+    execution-delay: (var-get execution-delay),
+    approval-threshold: (var-get approval-threshold),
+    membership-duration: (var-get membership-duration),
+    proposal-cooldown: (var-get proposal-cooldown)
+  }
+)
+
+;; Get proposal details
+(define-read-only (get-proposal (proposal-id uint))
+  (map-get? proposals { proposal-id: proposal-id })
+)
+
+;; Get treasury proposal details
+(define-read-only (get-treasury-proposal (proposal-id uint))
+  (map-get? treasury-proposals { proposal-id: proposal-id })
+)
+
+;; Get membership proposal details
+(define-read-only (get-membership-proposal (proposal-id uint))
+  (map-get? membership-proposals { proposal-id: proposal-id })
+)
+
+;; Get parameter proposal details
+(define-read-only (get-parameter-proposal (proposal-id uint))
+  (map-get? parameter-proposals { proposal-id: proposal-id })
+)
+
+;; Get contract proposal details
+(define-read-only (get-contract-proposal (proposal-id uint))
+  (map-get? contract-proposals { proposal-id: proposal-id })
+)
+
+;; Get member details
+(define-read-only (get-member (member-address principal))
+  (map-get? members { member: member-address })
+)
+
+;; Check if a member has a specific role
+(define-read-only (has-role (member-address principal) (role (string-ascii 20)))
+  (match (map-get? members { member: member-address })
+    member-data (some (index-of? (get roles member-data) role))
+    none
+  )
+)
+
+;; Get a user's vote on a proposal
+(define-read-only (get-vote (proposal-id uint) (voter principal))
+  (map-get? votes { proposal-id: proposal-id, voter: voter })
+)
+
+;; Get transaction details
+(define-read-only (get-transaction (tx-id uint))
+  (map-get? treasury-transactions { tx-id: tx-id })
+)
+
+;; Check if a proposal has reached quorum
+(define-read-only (has-reached-quorum (proposal-id uint))
+  (match (map-get? proposals { proposal-id: proposal-id })
+    proposal (>= 
+               (get total-voting-power proposal) 
+               (/ (* (var-get quorum-threshold) (var-get member-count)) u1000))
+    false
+  )
+)
+
+;; Check if a proposal has been approved
+(define-read-only (is-proposal-approved (proposal-id uint))
+  (match (map-get? proposals { proposal-id: proposal-id })
+    proposal (and
+               (has-reached-quorum proposal-id)
+               (>= 
+                 (get votes-for proposal) 
+                 (/ (* (var-get approval-threshold) (get total-voting-power proposal)) u1000)))
+    false
+  )
+)
+
+;; Get proposal status as string
+(define-read-only (get-proposal-status-string (status uint))
+  (match status
+    u0 "Active"
+    u1 "Passed"
+    u2 "Rejected"
+    u3 "Executed"
+    u4 "Failed"
+    "Unknown"
+  )
+)
+
+;; ===============================================
+;; Advanced Features
+;; ===============================================
+
+;; Delegate voting power
+(define-public (delegate-vote (proposal-id uint) (delegate principal))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+      (user-voting-power (get-voting-power tx-sender))
+      (curr-block block-height)
+    )
+    
+    ;; Check if user is an active member
+    (asserts! (is-active-member tx-sender) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if delegate is an active member
+    (asserts! (is-active-member delegate) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if proposal is still active for voting
+    (asserts! (<= curr-block (get end-block-height proposal)) ERR-VOTING-CLOSED)
+    
+    ;; Check if user has already voted
+    (asserts! (is-none (map-get? votes { proposal-id: proposal-id, voter: tx-sender })) ERR-ALREADY-VOTED)
+    
+    ;; Record delegation (mark as voted with special type u4 for delegation)
+    (map-set votes
+      { proposal-id: proposal-id, voter: tx-sender }
+      { vote: u4, voting-power: u0 }
+    )
+    
+    ;; Add voting power to delegate
+    (match (map-get? votes { proposal-id: proposal-id, voter: delegate })
+      existing-vote (map-set votes
+                      { proposal-id: proposal-id, voter: delegate }
+                      { vote: (get vote existing-vote), 
+                        voting-power: (+ (get voting-power existing-vote) user-voting-power) })
+      (ok true)  ;; Delegate hasn't voted yet, that's fine
+    )
+    
+    (ok true)
+  )
+)
+
+;; Cancel a proposal (by proposer or admin)
+(define-public (cancel-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? proposals { proposal-id: proposal-id }) ERR-PROPOSAL-NOT-FOUND))
+    )
+    
+    ;; Check if caller is proposer or admin
+    (asserts! (or (is-eq tx-sender (get proposer proposal)) (is-dao-admin)) ERR-NOT-AUTHORIZED)
+    
+    ;; Check if proposal is still active
+    (asserts! (is-eq (get status proposal) u0) ERR-PROPOSAL-NOT-READY)
+    
+    ;; Update proposal status to Failed (u4)
+    (map-set proposals
+      { proposal-id: proposal-id }
+      (merge proposal { status: u4 })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Import members from a previous DAO or other source
+(define-public (batch-import-members 
+                (members-list (list 20 {
+                  member: principal, 
+                  voting-power: uint, 
+                  roles: (list 5 (string-ascii 20))
+                })))
+  (begin
+    ;; Check if caller is admin
+    (asserts! (is-dao-admin) ERR-NOT-AUTHORIZED)
+    
+    ;; Process each member in the list
+    (map process-import-member members-list)
+    
+    (ok true)
+  )
+)
+
+;; Helper for batch import
+(define-private (process-import-member (member-data {
+  member: principal, 
+  voting-power: uint, 
+  roles: (list 5 (string-ascii 20))
+}))
+  (begin
+    ;; Check if member already exists - if yes, skip
+    (if (is-some (map-get? members { member: (get member member-data) }))
+        true
+        (begin
+          ;; Add new member
+          (map-set members
+            { member: (get member member-data) }
+            {
+              joining-block: block-height,
+              expiry-block: (+ block-height (var-get membership-duration)),
+              voting-power: (get voting-power member-data),
+              roles: (get roles member-data),
+              active: true
+            }
+          )
+          
+          ;; Increment member count
+          (var-set member-count (+ (var-get member-count) u1))
+          
+          true
+        ))
+  )
+)
+
+;; ===============================================
+;; Token Integration
+;; ===============================================
+
+;; Calculate voting power based on token holdings
+(define-public (sync-voting-power (member-address principal))
+  (let
+    (
+      (token-contract (var-get dao-token))
+      (token-balance (get-token-balance token-contract member-address))
+    )
+    
+    ;; Check if member exists
+    (match (map-get? members { member: member-address })
+      member-data (begin
+                    ;; Update voting power
+                    (map-set members
+                      { member: member-address }
+                      (merge member-data {
+                        voting-power: (calculate-voting-power token-balance)
+                      })
+                    )
+                    (ok true))
+      ERR-MEMBER-NOT-FOUND
+    )
+  )
+)
+
+;; Helper to calculate voting power from token balance
+(define-private (calculate-voting-power (token-balance uint))
+  ;; Simple linear function, but could be made more complex
+  ;; e.g., square root for quadratic voting
+  (if (< token-balance u10)
+      u1  ;; Minimum voting power
+      (/ token-balance u10))  ;; 1 vote per 10 tokens
+)
+
+;; Helper to get token balance (simplified)
+(define-private (get-token-balance (token-contract principal) (address principal))
+  ;; In a real implementation, this would call the token contract
+  ;; For simplicity, we'll return a placeholder value
+  u100
+)
+
+;; ===============================================
+;; Events and Hooks
+;; ===============================================
+
+;; Events for front-end notification
+(define-trait dao-event-trait
+  (
+    (emit-proposal-created (uint principal (string-ascii 100) uint) (response bool uint))
+    (emit-vote-cast (uint principal uint uint) (response bool uint))
+    (emit-proposal-executed (uint uint) (response bool uint))
+    (emit-member-added (principal (list 10 (string-ascii 20)) uint) (response bool uint))
+  )
+)
+
+;; Custom hook for proposal execution validation
+(define-trait proposal-validator-trait
+  (
+    (validate-proposal (uint) (response bool uint))
+  )
+)
+
+;; Hook for post-execution actions
+(define-trait proposal-executor-trait
+  (
+    (after-execution (uint) (response bool uint))
+  )
+)
+
+;; ===============================================
+;; Future Expansion Points
+;; ===============================================
+
+;; Support for SIP-009 NFT voting
+;; Support for SIP-010 fungible token voting
+;; Multi-sig execution of critical functions
+;; Advanced voting mechanisms (quadratic, conviction)
+;; Proposal templates
+
+;; ===============================================
+;; End of Contract
+;; ===============================================
